@@ -27,6 +27,7 @@ The validation set of HellaSwag has a total of 10,042 examples.
 
 import os
 import json
+import numpy as np
 import requests
 import tiktoken
 from tqdm import tqdm
@@ -34,6 +35,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from transformers import GPT2LMHeadModel
+
+from tokenizer import get_char_to_tokens_for_text
 
 # -----------------------------------------------------------------------------
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "hellaswag")
@@ -60,6 +63,7 @@ hellaswags = {
 }
 
 enc = tiktoken.get_encoding("gpt2")
+eot = enc._special_tokens['<|endoftext|>'] # end of text token
 
 def download(split):
     """Downloads HellaSwag DATA_CACHE_DIR"""
@@ -70,108 +74,139 @@ def download(split):
         print(f"Downloading {data_url} to {data_filename}...")
         download_file(data_url, data_filename)
 
-def render_example(example):
+def get_token_len(x):
+    if x == eot:
+        return 1
+    return len(enc.decode([x]))
+
+def get_pos_and_mask(x, ls):
+    B1, B2, T = x.size()
+
+    pos = torch.zeros(x.size(), dtype=torch.long)
+    mask = torch.zeros(x.size() + (T, ), dtype=torch.bool)
+    # Create a grid of indices for the first and second dimensions
+    batch_i_0 = torch.arange(B1).unsqueeze(1).expand(B1, B2)
+    batch_i_1 = torch.arange(B2).unsqueeze(0).expand(B1, B2)
+
+    for i in range(T):
+        current_i = torch.full((B1, B2), i)
+        prev_i = i - ls[:, :, i]
+        if any(prev_i.view(-1) >= 0):
+            cbi0, cbi1, cpi, cci = \
+                  batch_i_0[prev_i >= 0], batch_i_1[prev_i >= 0], prev_i[prev_i >= 0], current_i[prev_i >= 0]
+            pos[cbi0, cbi1, i] = pos[cbi0, cbi1, cpi] + 1
+            # pos[(prev_i < 0), i] = 0
+            mask[cbi0, cbi1, cci] = mask[cbi0, cbi1, cpi]
+        mask[batch_i_0, batch_i_1, current_i, current_i] = True
+    return pos, mask
+
+def render_example(example, B, T):
     """
     Given the example as a dictionary, render it as three torch tensors:
-    - tokens (the tokens of context + completion, of size 4xN, as there are always 4 candidates)
+    - tokens (the tokens of context + completion, of size B//4,4xN, as there are always 4 candidates)
     - mask (is 1 in the region of the candidate completion, where we evaluate likelihoods)
     - label (the index of the correct completion, which we hope has the highest likelihood)
     """
-    ctx = example["ctx"]
-    label = example["label"]
-    endings = example["endings"]
+    ctxs = [e['ctx'] for e in example] # (B//4, )
+    all_endings = [e['endings'] for e in example] # (B//4, 4)
+    labels = [e['label'] for e in example] # (B//4, )
+    ctx_tokens = [enc.encode(ctx) for ctx in ctxs] # (B//4, N_i)
+    ctx_tokens_lens = [[get_token_len(x) for x in ctx] for ctx in ctx_tokens]
 
-    # data needed to reproduce this eval on the C size
-    data = {
-        "label": label,
-        "ctx_tokens": None,
-        "ending_tokens": [],
-    }
+    tok_rows_batch = []
+    tok_len_rows_batch = []
+    target_rows_batch = []
+    for bi, endings in enumerate(all_endings):
+        tok_rows = []
+        tok_len_rows = []
+        target_rows = []
+        for end in endings:
+            char2tokens = get_char_to_tokens_for_text(" " + end)
+            char2tokens = char2tokens
+            end_tokens = [c for c, ts in char2tokens[1:]] # (N_o)
+            end_token_lens = [get_token_len(x) for x in end_tokens] # (N_o)
+            targets = [[]] * (len(ctx_tokens[bi]) - 1) + [ts for c, ts in char2tokens[:-1]] + [[]] * T # (T, N_e)
+            targets = targets[:T]
+            tok_rows.append(ctx_tokens[bi] + end_tokens) # (4, N_i+N_o)
+            tok_len_rows.append(ctx_tokens_lens[bi] + end_token_lens) # (4, N_i+N_o)
 
-    # gather up all the tokens
-    ctx_tokens = enc.encode(ctx)
-    data["ctx_tokens"] = ctx_tokens
-    tok_rows = []
-    mask_rows = []
-    for end in endings:
-        end_tokens = enc.encode(" " + end) # note: prepending " " because GPT-2 tokenizer
-        tok_rows.append(ctx_tokens + end_tokens)
-        mask_rows.append([0]*len(ctx_tokens) + [1]*len(end_tokens))
-        data["ending_tokens"].append(end_tokens)
+            target_rows.append(targets) # (4, N_o, N_e)
+        tok_rows_batch.append(tok_rows) # (B // 4, 4, N_i+N_o)
+        tok_len_rows_batch.append(tok_len_rows) # (B // 4, 4, N_i+N_o)
+        target_rows_batch.append(target_rows)
 
     # have to be careful during the collation because the number of tokens in each row can differ
-    max_len = max(len(row) for row in tok_rows)
-    tokens = torch.zeros((4, max_len), dtype=torch.long)
-    mask = torch.zeros((4, max_len), dtype=torch.long)
-    for i, (tok_row, mask_row) in enumerate(zip(tok_rows, mask_rows)):
-        tokens[i, :len(tok_row)] = torch.tensor(tok_row)
-        mask[i, :len(mask_row)] = torch.tensor(mask_row)
+    max_len = T # min(T, max(len(row) for tok_rows in tok_rows_batch for row in tok_rows))
+    # TBC
+    tokens = torch.zeros((B//4, 4, max_len), dtype=torch.long)
+    token_lens = torch.zeros((B//4, 4, max_len), dtype=torch.long)
+    for i, (tok_rows, tok_len_rows) in enumerate(zip(tok_rows_batch, tok_len_rows_batch)):
+        for j, (row, len_row) in enumerate(zip(tok_rows, tok_len_rows)):
+            tokens[i, j, :len(row[:max_len])] = torch.tensor(row[:max_len])
+            token_lens[i, j, :len(len_row[:max_len])] = torch.tensor(len_row[:max_len])
+    pos, mask = get_pos_and_mask(tokens, token_lens)
 
-    return data, tokens, mask, label
+    target_lens = np.array([[[len(t) for t in targets] for targets in tr] for tr in target_rows_batch ])  # (B//4, 4, T])
+    target_lens = np.transpose(target_lens, (2, 0, 1)).reshape(-1)
+    target_clens = np.cumsum(target_lens)
+    target_indices = np.insert(target_clens, 0, 0)
+    target_poses = np.arange(len(target_lens))[target_lens>0]
+    target_lens = target_lens[target_lens>0]
+    target_poses = np.repeat(target_poses, target_lens)
+    target_lens = np.repeat(target_lens, target_lens)
+    assert max(target_indices) <= len(target_lens), f'{max(target_indices), len(target_lens)}'
 
-def iterate_examples(split):
+    new_targets = []
+    for t in range(T):
+        for b1 in range(B//4):
+            for b2 in range(4):
+                new_targets += target_rows_batch[b1][b2][t]
+    ctx_len = torch.tensor([min(max_len, len(ct)) for ct in ctx_tokens], dtype=torch.long) # (B//4,)
+    tok_len = torch.tensor([[min(max_len, len(tok)) for tok in tr] for tr in tok_rows_batch ], dtype=torch.long) # (B//4, 4)
+    poses  = torch.tensor(target_poses, dtype=torch.long)
+    indices = torch.tensor(target_indices, dtype=torch.long)
+    lens = torch.tensor(target_lens, dtype=torch.long)
+    targets = torch.tensor(new_targets, dtype=torch.long)
+
+    y = ctx_len, tok_len, indices, poses, targets, lens# (B//4,), (B//4, 4), (B//4,4, T), (N_t,), (N_t,), (N_t,)
+    assert len(poses) == len(targets) == len(lens), f'{len(poses), len(targets), len(lens)}'
+
+    return tokens, pos, mask, y, labels
+
+def iterate_examples(split, B):
     # there are 10,042 examples in total in val
     download(split)
     with open(os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl"), "r") as f:
+        examples = []
         for line in f:
             example = json.loads(line)
-            yield example
+            examples.append(example)
+            if len(examples) >= B // 4:
+                examples_to_yield, examples = list(examples), []
+                yield examples_to_yield
+        if len(examples) >= B // 4:
+            yield examples
 
-@torch.no_grad()
-def evaluate(model_type, device):
-
-    torch.set_float32_matmul_precision('high') # use tf32
-    model = GPT2LMHeadModel.from_pretrained(model_type)
-    model.to(device)
-    # model = torch.compile(model) # optionally torch compile the model
-
-    num_correct_norm = 0
-    num_correct = 0
-    num_total = 0
-    for example in iterate_examples("val"):
-        data, tokens, mask, label = render_example(example)
-        tokens = tokens.to(device)
-        mask = mask.to(device)
-
-        # get the logits
-        logits = model(tokens).logits
-        # evaluate the autoregressive loss at all positions
-        shift_logits = (logits[..., :-1, :]).contiguous()
-        shift_tokens = (tokens[..., 1:]).contiguous()
-        flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        flat_shift_tokens = shift_tokens.view(-1)
-        shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
-        shift_losses = shift_losses.view(tokens.size(0), -1)
-        # now get the average loss just for the completion region (where mask == 1), in each row
-        shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
-        masked_shift_losses = shift_losses * shift_mask
-        # sum and divide by the number of 1s in the mask
-        sum_loss = masked_shift_losses.sum(dim=1)
-        avg_loss = sum_loss / shift_mask.sum(dim=1)
-        # now we have a loss for each of the 4 completions
-        # the one with the lowest loss should be the most likely
-        pred = sum_loss.argmin().item()
-        pred_norm = avg_loss.argmin().item()
-
-        # accumulate stats
-        num_total += 1
-        num_correct += int(pred == label)
-        num_correct_norm += int(pred_norm == label)
-        print(f"{num_total} acc_norm: {num_correct_norm}/{num_total}={num_correct_norm/num_total:.4f}")
-
-        # debug: pretty print a few examples, and the losses in each case
-        if num_total < 10:
-            print("---")
-            print(f"Context:\n {example['ctx']}")
-            print(f"Endings:")
-            for i, end in enumerate(example["endings"]):
-                print(f"{i} (loss: {avg_loss[i].item():.4f}) {end}")
-            print(f"predicted: {pred_norm}, actual: {label}")
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-m", "--model_type", type=str, default="gpt2", help="the model type to use")
-    parser.add_argument("-d", "--device", type=str, default="cuda", help="the device to use")
-    args = parser.parse_args()
-    evaluate(args.model_type, args.device)
+def get_most_likely_row(logits, y, T, B):
+    B1, B2 = B // 4, 4
+    ctx_len, tok_len, indices, poses, targets, lens = y # (B//4,), (B//4, 4), (B//4,4, T), (N_t,), (N_t,), (N_t,)
+    logits = logits.permute(2, 0, 1, 3)
+    logits = logits.reshape(-1, logits.size(-1))  # (T*B//4*4, C)
+    props = torch.zeros((T, B1, B2), dtype=torch.float32, device=logits.device)
+    # print(props.shape, ctx_len.shape, tok_len.shape, indices.shape, poses.shape, targets.shape, lens.shape)
+    props[ctx_len - 1, torch.arange(B1, device=logits.device), :] = 1.0
+    props = props.view(-1)
+    for t in range(T):
+        start_i, end_i = indices[t * B1*B2], indices[(t+1)*B1*B2]
+        cur_pos = poses[start_i:end_i]
+        next_pos = torch.clamp(cur_pos + lens[start_i:end_i] * B1 * B2, max=(T-1)*B1*B2 + cur_pos % (B1*B2))
+        cur_props = props[cur_pos]
+        cur_targets = targets[start_i:end_i]
+        cur_logits = F.softmax(logits[cur_pos, cur_targets], dim=-1)
+        props[next_pos] = props[next_pos] + cur_props * cur_logits
+    batch_i_0 = torch.arange(B1, device=logits.device).unsqueeze(1).expand(B1, B2)
+    batch_i_1 = torch.arange(B2, device=logits.device).unsqueeze(0).expand(B1, B2)
+    props = props.view((T, B1, B2))
+    props_end = props[tok_len-1, batch_i_0, batch_i_1] # (B//4, 4)
+    pred_norm = props_end.argmax(dim=1).tolist() # (B//4)
+    return pred_norm
