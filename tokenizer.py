@@ -12,15 +12,19 @@ def get_words_for_text(text):
   return words
 
 def get_char_to_tokens_for_word(word):
-  char2tokens = list()
-  for i in range(len(word)+1):
-    left = enc.encode(word[:i])
-    right = []
-    for j in range(i+1, len(word)+1):
-      right.append(enc.encode(word[i:j]))
-
-    char2tokens.append([left[-1] if left else -1, {i[0] for i in right} if right else -1])
-  return char2tokens
+    word_bytes = word.encode('utf-8')
+    char2tokens = []
+    for i in range(len(word_bytes) + 1):
+        if i > 0:
+          left = enc._encode_single_piece(word_bytes[:i])
+        else:
+          left = []
+        right = []
+        for j in range(i + 1, len(word_bytes) + 1):
+            if word_bytes[i:j] in enc._mergeable_ranks:
+                right.append(enc._mergeable_ranks[word_bytes[i:j]])
+        char2tokens.append([left[-1] if left else -1, right if right else -1])
+    return char2tokens
 
 def unite_lists(lists):
     lists = sum(lists, [])
@@ -57,7 +61,7 @@ def get_char2trace_step(char2tokens):
   char2trace_step = [-1] # there is no trace for <|endoftext|>, mask will be 0 for this token
   for i in range(1, len(char2tokens)):
     c = char2tokens[i][0]
-    token_len = len(enc.decode([c]))
+    token_len = len(enc.decode_bytes([c]))
     prev_i = i - token_len
     assert c in char2tokens[prev_i][1]
     char2trace_step.append(prev_i)

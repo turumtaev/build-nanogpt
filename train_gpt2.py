@@ -217,7 +217,7 @@ import numpy as np
 def get_token_len(x):
     if x == eot:
         return 1
-    return len(enc.decode([x]))
+    return len(enc.decode_bytes([x]))
 
 def load_x(filename):
     npx = np.load(filename)

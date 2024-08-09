@@ -25,7 +25,8 @@ DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 # download the dataset
-fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train")
+nprocs = max(1, os.cpu_count()//2)
+fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train", num_proc=nprocs)
 
 # init the tokenizer
 enc = tiktoken.get_encoding("gpt2")
@@ -34,22 +35,27 @@ def tokenize(doc):
     # tokenizes a single document and returns a numpy array of uint16 tokens
     char2tokens = get_char_to_tokens_for_text(doc['text'])
     char2tokens[0][0] = eot
-    char2tokens[-1][1] = {eot}
-    x = [c for c, ts in char2tokens]
+    char2tokens[-1][1] = [eot]
+    x, y = zip(*char2tokens)
+    x, y = list(x), list(y)
     x_np = np.array(x)
     assert (0 <= x_np).all() and (x_np < 2**16).all(), "token dictionary too large for uint16"
     x_np_uint16 = x_np.astype(np.uint16)
-
-    y = [list(ts) for c, ts in char2tokens]
     y_np = np.array(y, dtype=object)
     return x_np_uint16, y_np
 
 def write_datafile(filename, data):
     np.save(filename, data)
 
+def save_in_background(filename, data):
+    process = mp.Process(target=write_datafile, args=(filename, data))
+    process.start()
+    return process  # Return the process in case you want to join it later
+
 # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
 def main():
     nprocs = max(1, os.cpu_count()//2)
+    processes = []
     with mp.Pool(nprocs) as pool:
         shard_index = 0
         # preallocate buffer to hold current shard
@@ -57,7 +63,7 @@ def main():
         all_y_np = np.empty((shard_size,), dtype=object)
         token_count = 0
         progress_bar = None
-        for x, y in pool.imap(tokenize, fw, chunksize=16):
+        for x, y in pool.imap(tokenize, fw, chunksize=4):
             if shard_index >= 100:
                 break
             # is there enough space in the current shard for the new tokens?
@@ -81,8 +87,9 @@ def main():
                 progress_bar.update(remainder)
                 all_x_np[token_count:token_count+remainder] = x[:remainder]
                 all_y_np[token_count:token_count+remainder] = y[:remainder]
-                write_datafile(x_filename, all_x_np)
-                write_datafile(y_filename, all_y_np)
+                process_x = save_in_background(x_filename, all_x_np)
+                process_y = save_in_background(y_filename, all_y_np)
+                processes.extend([process_x, process_y])
                 shard_index += 1
                 progress_bar = None
                 # populate the next shard with the leftovers of the current doc
@@ -95,8 +102,11 @@ def main():
             split = "val" if shard_index < 1 else "train"
             x_filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_x_{split}_{shard_index:06d}")
             y_filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_y_{split}_{shard_index:06d}")
-            write_datafile(x_filename, all_x_np[:token_count])
-            write_datafile(y_filename, all_y_np[:token_count])
+            process_x = save_in_background(x_filename, all_x_np[:token_count])
+            process_y = save_in_background(y_filename, all_y_np[:token_count])
+            processes.extend([process_x, process_y])
+        for process in processes:
+            process.join()
 
 if __name__ == '__main__':
     main()

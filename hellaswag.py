@@ -77,7 +77,7 @@ def download(split):
 def get_token_len(x):
     if x == eot:
         return 1
-    return len(enc.decode([x]))
+    return len(enc.decode_bytes([x]))
 
 def get_pos_and_mask(x, ls):
     B1, B2, T = x.size()
