@@ -21,6 +21,8 @@ def get_char_to_tokens_for_word(word):
           left = []
         right = []
         for j in range(i + 1, len(word_bytes) + 1):
+            if j > i + 130:
+                break
             if word_bytes[i:j] in enc._mergeable_ranks:
                 right.append(enc._mergeable_ranks[word_bytes[i:j]])
         char2tokens.append([left[-1] if left else -1, right if right else -1])
