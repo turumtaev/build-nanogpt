@@ -25,32 +25,16 @@ def get_char_to_tokens_for_word(word):
                 break
             if word_bytes[i:j] in enc._mergeable_ranks:
                 right.append(enc._mergeable_ranks[word_bytes[i:j]])
-        char2tokens.append([left[-1] if left else -1, right if right else -1])
+        char2tokens.append([left[-1] if left else -1, tuple(right)])
     return char2tokens
 
 def unite_lists(lists):
-    lists = sum(lists, [])
-    result = []
-    skip_next = False
-
-    for i in range(len(lists) - 1):
-        if skip_next:
-            skip_next = False
-            continue
-
-        current_list = lists[i]
-        next_list = lists[i + 1]
-
-        if current_list[-1] == -1 and next_list[0] == -1:
-            combined_list = current_list[:-1] + next_list[1:]
-            result.append(combined_list)
-            skip_next = True
-        else:
-            result.append(current_list)
-
-    if not skip_next:
-        result.append(lists[-1])
-
+    if not lists:
+      return []
+    result = lists[0]
+    for l in lists[1:]:
+        result[-1][1] = l[0][1]
+        result.extend(l[1:])
     return result
 
 def get_char_to_tokens_for_text(text):
