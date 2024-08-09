@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from hellaswag import render_example, iterate_examples
+from hellaswag import render_example, iterate_examples, get_most_likely_row
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -23,7 +23,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, x):
+    def forward(self, x, mask):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
@@ -33,7 +33,7 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.unsqueeze(1)) # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -63,8 +63,8 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, mask):
+        x = x + self.attn(self.ln_1(x), mask)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -75,6 +75,15 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
+
+def custom_cross_entropy_loss(outputs, targets):
+    # output (B*T, classes_number)
+    rows, columns, counts = targets
+    # rows (N, ), columns (N, ), counts (N, )
+    outputs = F.log_softmax(outputs, dim=1)
+    outputs = outputs[rows, columns] / (counts * outputs.size(0))
+
+    return -torch.sum(outputs)
 
 class GPT(nn.Module):
 
@@ -107,24 +116,23 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, pos, mask, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         # forward the token and posisition embeddings
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
         x = tok_emb + pos_emb
         # forward the blocks of the transformer
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, mask)
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = custom_cross_entropy_loss(logits.view(-1, logits.size(-1)), targets)
         return logits, loss
 
     @classmethod
@@ -202,14 +210,41 @@ class GPT(nn.Module):
         return optimizer
 
 # -----------------------------------------------------------------------------
+import torch
 import tiktoken
 import numpy as np
 
-def load_tokens(filename):
-    npt = np.load(filename)
-    npt = npt.astype(np.int32) # added after video
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
+def get_token_len(x):
+    if x == eot:
+        return 1
+    return len(enc.decode([x]))
+
+def load_x(filename):
+    npx = np.load(filename)
+    npx = npx.astype(np.int32) # added after video
+    np_len = np.array([get_token_len(x) for x in npx], dtype=np.int32)
+
+    ptx = torch.tensor(npx, dtype=torch.long)
+    ptx_len = torch.tensor(np_len, dtype=torch.long)
+
+    return ptx, ptx_len
+
+def load_y(filename):
+    npy = np.load(filename, allow_pickle=True)
+    # get array of lengths
+    npl = np.vectorize(len)(npy)
+    csl = np.cumsum(npl)
+    # get array of indices
+    npi = np.insert(csl[:-1], 0, 0)
+    nprows = np.repeat(np.arange(len(npl)), npl)
+    npy = np.concatenate(npy)
+    npl_repeated = np.repeat(npl, npl)
+
+    ptrows = torch.tensor(nprows, dtype=torch.long)
+    pty = torch.tensor(npy, dtype=torch.long)
+    ptl = torch.tensor(npl_repeated, dtype=torch.float32)
+    pti = torch.tensor(npi, dtype=torch.long)
+    return ptrows, pty, ptl, pti
 
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split):
@@ -217,7 +252,7 @@ class DataLoaderLite:
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
-        assert split in {'train', 'val'}
+        assert split in {'x_train', 'x_val'} # add only xs
 
         # get the shard filenames
         data_root = "edu_fineweb10B"
@@ -231,48 +266,102 @@ class DataLoaderLite:
             print(f"found {len(shards)} shards for split {split}")
         self.reset()
 
+    def get_y_shard_name(self, shard):
+        return shard.replace('x_train', 'y_train').replace('x_val', 'y_val')
+
+    def get_y_list(self, B, T):
+        # y - matrix of indices, need to convert it to probabilities
+        yinds = self.yinds[self.current_position], self.yinds[self.current_position+B*T]
+        y = self.ys[yinds[0] : yinds[1]]
+        rows = self.yrows[yinds[0] : yinds[1]]
+        y_counts = self.ylens[yinds[0] : yinds[1]]
+        # reset row indices to start from 0
+        first_index = rows[0]
+        rows = rows - first_index
+        return [rows, y, y_counts]
+
+    def get_pos_and_mask(self, B, T):
+        ls = self.xlens[self.current_position : self.current_position+B*T].view(B, T)
+        pos = torch.zeros((B, T), dtype=torch.long)
+        mask = torch.zeros((B, T, T), dtype=torch.bool)
+        batch_i = torch.arange(B)
+
+        for i in range(T):
+            current_i = torch.full((B,), i)
+            prev_i = i - ls[:, i]
+            if any(prev_i >= 0):
+                pos[(prev_i >= 0), i] = pos[(prev_i >= 0), prev_i[(prev_i >= 0)]] + 1
+                # pos[(prev_i < 0), i] = 0
+                cbi, cpi, cci = batch_i[prev_i >= 0], prev_i[prev_i >= 0], current_i[prev_i >= 0]
+                mask[cbi, cci] = mask[cbi, cpi]
+            mask[batch_i, current_i, current_i] = True
+        return pos, mask
+
     def reset(self):
         # state, init at shard zero
         self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.xs, self.xlens = load_x(self.shards[self.current_shard])
+        self.yrows, self.ys, self.ylens, self.yinds = load_y(self.get_y_shard_name(self.shards[self.current_shard]))
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
+        x = self.xs[self.current_position : self.current_position+B*T].view(B, T) # inputs
+        pos, mask = self.get_pos_and_mask(B, T)
+
+        y = self.get_y_list(B, T)
         # advance the position in the tensor
         self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, advance to next shard
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+        if self.current_position + (B * T * self.num_processes) > len(self.xs):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.process_rank
-        return x, y
+            self.xs, self.xlens = load_x(self.shards[self.current_shard])
+            self.yrows, self.ys, self.ylens, self.yinds = load_y(self.get_y_shard_name(self.shards[self.current_shard]))
+            self.current_position = self.B * self.T * self.process_rank
+        return x, y, pos, mask
 
 # -----------------------------------------------------------------------------
-# helper function for HellaSwag eval
-# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
 
-def get_most_likely_row(tokens, mask, logits):
-    # evaluate the autoregressive loss at all positions
-    shift_logits = (logits[..., :-1, :]).contiguous()
-    shift_tokens = (tokens[..., 1:]).contiguous()
-    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-    flat_shift_tokens = shift_tokens.view(-1)
-    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
-    shift_losses = shift_losses.view(tokens.size(0), -1)
-    # now get the average loss just for the completion region (where mask == 1), in each row
-    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
-    masked_shift_losses = shift_losses * shift_mask
-    # sum and divide by the number of 1s in the mask
-    sum_loss = masked_shift_losses.sum(dim=1)
-    avg_loss = sum_loss / shift_mask.sum(dim=1)
-    # now we have a loss for each of the 4 completions
-    # the one with the lowest loss should be the most likely
-    pred_norm = avg_loss.argmin().item()
-    return pred_norm
+
+def reset_tokens(sequences):
+    '''
+    decode tokens back to text, encode it in more optimal way,
+    make all sequences in batch the same size,
+    pad left size with eot, mask padding with 0 for attention,
+    '''
+    eot = enc._special_tokens['<|endoftext|>'] # end of text token
+
+    # Determine the maximum length of the sequences
+    max_len = max(len(seq) for seq in sequences)
+
+    # Pad sequences and compute shifts
+    padded_sequences = []
+    shifts = []
+    for seq in sequences:
+        shift = max_len - len(seq)
+        shifts.append(shift)
+        padded_seq = [eot] * shift + seq
+        padded_sequences.append(padded_seq)
+
+    # Convert to torch tensor
+    tokens = torch.tensor(padded_sequences, dtype=torch.long, device=device)
+
+    pos = torch.arange(max_len, dtype=torch.long, device=device)\
+              .unsqueeze(0).repeat(len(sequences), 1)
+    mask = torch.ones(max_len, max_len, dtype=torch.bool, device=device)\
+              .tril(diagonal=0).unsqueeze(0).repeat(len(sequences), 1, 1)
+
+    # Compute positions
+    shifts_tensor = torch.tensor(shifts, dtype=torch.long, device=device)
+    pos = pos - shifts_tensor.unsqueeze(1)
+    pos = torch.clamp(pos, min=0)  # Replace negative with 0
+
+    # Create mask
+    for i, shift in enumerate(shifts):
+        if shift > 0:
+            mask[i, max_len-shift:, :shift] = 0
+
+    return tokens, pos, mask, shifts
 
 # -----------------------------------------------------------------------------
 # simple launch:
@@ -320,9 +409,10 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 enc = tiktoken.get_encoding("gpt2")
+eot = enc._special_tokens['<|endoftext|>']
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
+B = 8 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -330,8 +420,8 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="x_train")
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="x_val")
 
 torch.set_float32_matmul_precision('high')
 
@@ -349,7 +439,8 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+# from the same amount of text new tokenizer creates ~5 times more training data
+max_steps = 100000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -385,10 +476,11 @@ for step in range(max_steps):
             val_loss_accum = 0.0
             val_loss_steps = 20
             for _ in range(val_loss_steps):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
+                x, y, pos, mask = val_loader.next_batch()
+                x, pos, mask = x.to(device), pos.to(device), mask.to(device)
+                y = [yy.to(device) for yy in y]
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
+                    logits, loss = model(x, pos, mask, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
         if ddp:
@@ -414,21 +506,24 @@ for step in range(max_steps):
     if (step % 250 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
-        for i, example in enumerate(iterate_examples("val")):
+        for i, example in enumerate(iterate_examples("val", B)):
             # only process examples where i % ddp_world_size == ddp_rank
             if i % ddp_world_size != ddp_rank:
                 continue
             # render the example into tokens and labels
-            _, tokens, mask, label = render_example(example)
-            tokens = tokens.to(device)
-            mask = mask.to(device)
+            x, pos, mask, y, labels = render_example(example, len(example) * 4, T)
+            x, pos, mask = x.to(device).view(-1, x.size(-1)),\
+                           pos.to(device).view(-1, pos.size(-1)),\
+                           mask.to(device).view(-1, mask.size(-2), mask.size(-1))
+            y = [yy.to(device) for yy in y]
             # get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
-                pred_norm = get_most_likely_row(tokens, mask, logits)
-            num_total += 1
-            num_correct_norm += int(pred_norm == label)
+                    logits, loss = model(x, pos, mask)
+                logits = logits.view(len(example), 4, logits.size(-2), logits.size(-1))
+                pred_norm = get_most_likely_row(logits, y, T, len(example) * 4)
+            num_total += len(example)
+            num_correct_norm += sum([p == l for p, l in zip(pred_norm, labels)])
         # reduce the stats across all processes
         if ddp:
             num_total = torch.tensor(num_total, dtype=torch.long, device=device)
@@ -452,13 +547,18 @@ for step in range(max_steps):
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device)
+        pos = torch.arange(xgen.shape[1], dtype=torch.long, device=device)\
+              .unsqueeze(0).repeat(num_return_sequences, 1)
+        mask = torch.ones(xgen.shape[1], xgen.shape[1], dtype=torch.bool, device=device)\
+              .tril(diagonal=0).unsqueeze(0).repeat(num_return_sequences, 1, 1)
+        shifts = [0] * num_return_sequences
         sample_rng = torch.Generator(device=device)
         sample_rng.manual_seed(42 + ddp_rank)
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) # (B, T, vocab_size)
+                    logits, loss = model(xgen, pos, mask) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
                 # get the probabilities
@@ -473,9 +573,16 @@ for step in range(max_steps):
                 xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
                 # append to the sequence
                 xgen = torch.cat((xgen, xcol), dim=1)
+                tokens = xgen[:max_length].tolist()
+                tokens = [line[s:] for line, s in zip(tokens, shifts)]
+                # decode the tokens
+                tokens = enc.encode_batch(enc.decode_batch(tokens), allowed_special={'<|endoftext|>'})
+                xgen, pos, mask, shifts = reset_tokens(tokens)
+
         # print the generated text
         for i in range(num_return_sequences):
             tokens = xgen[i, :max_length].tolist()
+            tokens = tokens[shifts[i]:]
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
@@ -484,13 +591,14 @@ for step in range(max_steps):
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
+        x, y, pos, mask = train_loader.next_batch()
+        x, pos, mask = x.to(device), pos.to(device), mask.to(device)
+        y = [yy.to(device) for yy in y]
         # added after video, this field is also used by the forward pass.
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
+            logits, loss = model(x, pos, mask, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
