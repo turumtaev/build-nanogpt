@@ -262,6 +262,7 @@ class DataLoaderLite:
         assert len(shards) > 0, f"no shards found for split {split}"
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
+        self.empty=True
         self.reset()
 
     def get_y_list(self, B, T):
@@ -295,8 +296,10 @@ class DataLoaderLite:
     def reset(self):
         # state, init at shard zero
         self.current_shard = 0
-        self.xs, self.xlens = load_x(self.shards[self.current_shard])
-        self.yrows, self.ys, self.ylens, self.yinds = load_y(self.shards[self.current_shard])
+        if len(self.shards) != 1 or self.empty:
+            self.xs, self.xlens = load_x(self.shards[self.current_shard])
+            self.yrows, self.ys, self.ylens, self.yinds = load_y(self.shards[self.current_shard])
+            self.empty=False
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
@@ -310,8 +313,10 @@ class DataLoaderLite:
         # if loading the next batch would be out of bounds, advance to next shard
         if self.current_position + (B * T * self.num_processes) > len(self.xs):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.xs, self.xlens = load_x(self.shards[self.current_shard])
-            self.yrows, self.ys, self.ylens, self.yinds = load_y(self.shards[self.current_shard])
+            if len(self.shards) != 1 or self.empty:
+                self.xs, self.xlens = load_x(self.shards[self.current_shard])
+                self.yrows, self.ys, self.ylens, self.yinds = load_y(self.shards[self.current_shard])
+                self.empty=False
             self.current_position = self.B * self.T * self.process_rank
         return x, y, pos, mask
 
