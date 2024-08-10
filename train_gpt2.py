@@ -245,7 +245,13 @@ class DataLoaderLite:
         self.process_rank = process_rank
         self.num_processes = num_processes
         assert split in {'x_train', 'x_val'} # add only xs
+        self.split = split
+        self.update_shards_names(split)
 
+        self.empty=True
+        self.reset()
+
+    def update_shards_names(self, split):
         # get the shard filenames
         data_root = "edu_fineweb10B"
         shards = os.listdir(data_root)
@@ -256,8 +262,6 @@ class DataLoaderLite:
         assert len(shards) > 0, f"no shards found for split {split}"
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
-        self.empty=True
-        self.reset()
 
     def get_y_list(self, B, T):
         # y - matrix of indices, need to convert it to probabilities
@@ -290,7 +294,7 @@ class DataLoaderLite:
     def reset(self):
         # state, init at shard zero
         self.current_shard = 0
-        if len(self.shards) != 1 or self.empty:
+        if self.split == 'x_train' or len(self.shards) != 1 or self.empty:
             self.xs, self.xlens = load_x(self.shards[self.current_shard])
             self.yrows, self.ys, self.ylens, self.yinds = load_y(self.shards[self.current_shard])
             self.empty=False
@@ -306,8 +310,9 @@ class DataLoaderLite:
         self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, advance to next shard
         if self.current_position + (B * T * self.num_processes) > len(self.xs):
+            self.update_shards_names(self.split)
             self.current_shard = (self.current_shard + 1) % len(self.shards)
-            if len(self.shards) != 1 or self.empty:
+            if self.split == 'x_train' or  len(self.shards) != 1 or self.empty:
                 self.xs, self.xlens = load_x(self.shards[self.current_shard])
                 self.yrows, self.ys, self.ylens, self.yinds = load_y(self.shards[self.current_shard])
                 self.empty=False
@@ -506,9 +511,9 @@ for step in range(max_steps):
                 continue
             # render the example into tokens and labels
             x, pos, mask, y, labels = render_example(example, len(example) * 4, T)
-            x, pos, mask = x.to(device).view(-1, x.size(-1)),\
-                           pos.to(device).view(-1, pos.size(-1)),\
-                           mask.to(device).view(-1, mask.size(-2), mask.size(-1))
+            x = x.to(device).view(-1, x.size(-1))
+            pos = pos.to(device).view(-1, pos.size(-1))
+            mask = mask.to(device).view(-1, mask.size(-2), mask.size(-1))
             y = [yy.to(device) for yy in y]
             # get the logits
             with torch.no_grad():
