@@ -233,7 +233,7 @@ def get_k_shard_name(shard, k):
     return shard.replace('x_train', f'{k}_train').replace('x_val', f'{k}_val')
 
 def load_y(filename):
-    npy = np.load(get_k_shard_name(filename, "y"))
+    npy = np.load(get_k_shard_name(filename, "y")).astype(np.int32)
     npl = np.load(get_k_shard_name(filename, "len"))
     nprows = np.load(get_k_shard_name(filename, "rows"))
     npi = np.load(get_k_shard_name(filename, "indices"))
