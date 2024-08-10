@@ -410,8 +410,8 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 eot = enc._special_tokens['<|endoftext|>']
 
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
+total_batch_size = 393216 # 2**19, ~0.5M, in number of tokens
+B = 48 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -437,19 +437,19 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715
+warmup_steps = 950
 # from the same amount of text new tokenizer creates ~5 times more training data
-max_steps = 100000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
-lr_max_steps = 25000
+max_steps = 200000 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps_lr = 25000
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
     # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_max_steps:
+    if it > max_steps_lr:
         return min_lr
     # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (lr_max_steps - warmup_steps)
+    decay_ratio = (it - warmup_steps) / (max_steps_lr - warmup_steps)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
@@ -503,7 +503,7 @@ for step in range(max_steps):
                 torch.save(checkpoint, checkpoint_path)
 
     # once in a while evaluate hellaswag
-    if (step % 250 == 0 or last_step) and (not use_compile):
+    if (step % 2500 == 0 or last_step) and (not use_compile):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val", B)):

@@ -91,7 +91,7 @@ def main():
         y_count = 0
         progress_bar = None
         for x, x_len, y in pool.imap(tokenize, fw, chunksize=4):
-            if shard_index >= 100:
+            if shard_index >= 10000:
                 break
             # is there enough space in the current shard for the new tokens?
             if token_count + len(x) < shard_size:
@@ -125,10 +125,11 @@ def main():
                 all_np["xlen"][token_count:token_count+remainder] = x_len[:remainder]
 
                 nprows, npy, npl, npi = y
-                if remainder != len(x):
+                if remainder == len(x):
                     npy_remainder = len(npy)
                 else:
                     npy_remainder = npi[remainder]
+                print('lens and reminders:', len(x), len(npy), remainder, npy_remainder)
                     
                 npi = npi + y_count
                 nprows = nprows + token_count
@@ -144,7 +145,7 @@ def main():
                     "len": y_count,
                     "indices": token_count
                 }
-                cur_processes = [save_in_background(filenames[k], all_np[k][:k2counts[k]]) for k in all_np]
+                cur_processes = [write_datafile(filenames[k], all_np[k][:k2counts[k]]) for k in all_np]
                 processes.extend(cur_processes)
                 shard_index += 1
                 progress_bar = None
@@ -152,14 +153,14 @@ def main():
                 all_np["x"][0:len(x)-remainder] = x[remainder:]
                 all_np["xlen"][0:len(x)-remainder] = x_len[remainder:]
                 all_np["y"][0:len(npy)-npy_remainder] = npy[npy_remainder:]
-                all_np["rows"][0:len(npy)-npy_remainder] = nprows[npy_remainder:]
+                all_np["rows"][0:len(npy)-npy_remainder] = nprows[npy_remainder:] - nprows[npy_remainder]
                 all_np["len"][0:len(npy)-npy_remainder] = npl[npy_remainder:]
                 all_np["indices"][0:len(x)-remainder] = npi[remainder:] - npi[remainder]
                 token_count = len(x)-remainder
                 y_count = len(npy)-npy_remainder
 
         # write any remaining tokens as the last shard
-        if token_count != 0 and shard_index < 100:
+        if token_count != 0 and shard_index < 10000:
             split = "val" if shard_index < 1 else "train"
             filenames = {k: os.path.join(DATA_CACHE_DIR, f"edufineweb_{k}_{split}_{shard_index:06d}") for k in all_np}
             k2counts = {
@@ -170,10 +171,12 @@ def main():
                 "len": y_count,
                 "indices": token_count
             }
-            cur_processes = [save_in_background(filenames[k], all_np[k][:k2counts[k]]) for k in all_np]
+            cur_processes = [write_datafile(filenames[k], all_np[k][:k2counts[k]]) for k in all_np]
             processes.extend(cur_processes)
-        for process in processes:
-            process.join()
+        # for process in processes:
+        #     process.join()
+        print('finish')
 
 if __name__ == '__main__':
     main()
+    print('done!')
