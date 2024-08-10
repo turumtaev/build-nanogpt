@@ -214,23 +214,17 @@ import torch
 import tiktoken
 import numpy as np
 
-def get_token_len(x):
-    if x == eot:
-        return 1
-    return len(enc.decode_bytes([x]))
+def get_k_shard_name(shard, k):
+    return shard.replace('x_train', f'{k}_train').replace('x_val', f'{k}_val')
 
 def load_x(filename):
-    npx = np.load(filename)
-    npx = npx.astype(np.int32) # added after video
-    np_len = np.array([get_token_len(x) for x in npx], dtype=np.int32)
+    npx = np.load(filename).astype(np.int32)
+    np_len = np.load(get_k_shard_name(filename, "xlen")).astype(np.int32)
 
     ptx = torch.tensor(npx, dtype=torch.long)
     ptx_len = torch.tensor(np_len, dtype=torch.long)
 
     return ptx, ptx_len
-
-def get_k_shard_name(shard, k):
-    return shard.replace('x_train', f'{k}_train').replace('x_val', f'{k}_val')
 
 def load_y(filename):
     npy = np.load(get_k_shard_name(filename, "y")).astype(np.int32)

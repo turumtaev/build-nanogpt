@@ -44,6 +44,11 @@ def transform_y(y):
     npl_repeated = np.repeat(npl, npl)
     return nprows, npy, npl_repeated, npi
 
+def get_token_len(x):
+    if x == eot:
+        return 1
+    return len(enc.decode_bytes([x]))
+
 def tokenize(doc):
     # tokenizes a single document and returns a numpy array of uint16 tokens
     char2tokens = get_char_to_tokens_for_text(doc['text'])
@@ -52,9 +57,9 @@ def tokenize(doc):
     x, y = zip(*char2tokens)
     x, y = list(x), list(y)
     x_np = np.array(x)
+    x_len = np.vectorize(get_token_len)(x_np)
     assert (0 <= x_np).all() and (x_np < 2**16).all(), "token dictionary too large for uint16"
-    x_np_uint16 = x_np.astype(np.uint16)
-    return x_np_uint16, transform_y(y)
+    return x_np.astype(np.uint16), x_len.astype(np.uint16), transform_y(y)
 
 def write_datafile(filename, data):
     try:
@@ -76,6 +81,7 @@ def main():
         # preallocate buffer to hold current shard
         all_np = {
             "x": np.empty((shard_size,), dtype=np.uint16),
+            "xlen": np.empty((shard_size,), dtype=np.uint16),
             "y": np.empty((shard_size * 10,), dtype=np.uint16),
             "rows": np.empty((shard_size * 10,), dtype=np.int64),
             "len": np.empty((shard_size * 10,), dtype=np.int64),
@@ -84,13 +90,14 @@ def main():
         token_count = 0
         y_count = 0
         progress_bar = None
-        for x, y in pool.imap(tokenize, fw, chunksize=4):
+        for x, x_len, y in pool.imap(tokenize, fw, chunksize=4):
             if shard_index >= 100:
                 break
             # is there enough space in the current shard for the new tokens?
             if token_count + len(x) < shard_size:
                 # simply append tokens to current shard
                 all_np["x"][token_count:token_count+len(x)] = x
+                all_np["xlen"][token_count:token_count+len(x)] = x_len
 
                 nprows, npy, npl, npi = y
                 npi = npi + y_count
@@ -115,6 +122,7 @@ def main():
                 remainder = shard_size - token_count
                 progress_bar.update(remainder)
                 all_np["x"][token_count:token_count+remainder] = x[:remainder]
+                all_np["xlen"][token_count:token_count+remainder] = x_len[:remainder]
 
                 nprows, npy, npl, npi = y
                 if remainder != len(x):
@@ -130,6 +138,7 @@ def main():
                 all_np["indices"][token_count:token_count+remainder] = npi[:remainder]
                 k2counts = {
                     "x": token_count,
+                    "xlen": token_count,
                     "y": y_count,
                     "rows": y_count,
                     "len": y_count,
@@ -141,6 +150,7 @@ def main():
                 progress_bar = None
                 # populate the next shard with the leftovers of the current doc
                 all_np["x"][0:len(x)-remainder] = x[remainder:]
+                all_np["xlen"][0:len(x)-remainder] = x_len[remainder:]
                 all_np["y"][0:len(npy)-npy_remainder] = npy[npy_remainder:]
                 all_np["rows"][0:len(npy)-npy_remainder] = nprows[npy_remainder:]
                 all_np["len"][0:len(npy)-npy_remainder] = npl[npy_remainder:]
@@ -154,6 +164,7 @@ def main():
             filenames = {k: os.path.join(DATA_CACHE_DIR, f"edufineweb_{k}_{split}_{shard_index:06d}") for k in all_np}
             k2counts = {
                 "x": token_count,
+                "xlen": token_count,
                 "y": y_count,
                 "rows": y_count,
                 "len": y_count,
