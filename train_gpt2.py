@@ -229,20 +229,18 @@ def load_x(filename):
 
     return ptx, ptx_len
 
+def get_k_shard_name(shard, k):
+    return shard.replace('x_train', f'{k}_train').replace('x_val', f'{k}_val')
+
 def load_y(filename):
-    npy = np.load(filename, allow_pickle=True)
-    # get array of lengths
-    npl = np.vectorize(len)(npy)
-    csl = np.cumsum(npl)
-    # get array of indices
-    npi = np.insert(csl[:-1], 0, 0)
-    nprows = np.repeat(np.arange(len(npl)), npl)
-    npy = np.concatenate(npy)
-    npl_repeated = np.repeat(npl, npl)
+    npy = np.load(get_k_shard_name(filename, "y"))
+    npl = np.load(get_k_shard_name(filename, "len"))
+    nprows = np.load(get_k_shard_name(filename, "rows"))
+    npi = np.load(get_k_shard_name(filename, "indices"))
 
     ptrows = torch.tensor(nprows, dtype=torch.long)
     pty = torch.tensor(npy, dtype=torch.long)
-    ptl = torch.tensor(npl_repeated, dtype=torch.float32)
+    ptl = torch.tensor(npl, dtype=torch.float32)
     pti = torch.tensor(npi, dtype=torch.long)
     return ptrows, pty, ptl, pti
 
@@ -265,9 +263,6 @@ class DataLoaderLite:
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
         self.reset()
-
-    def get_y_shard_name(self, shard):
-        return shard.replace('x_train', 'y_train').replace('x_val', 'y_val')
 
     def get_y_list(self, B, T):
         # y - matrix of indices, need to convert it to probabilities
@@ -301,7 +296,7 @@ class DataLoaderLite:
         # state, init at shard zero
         self.current_shard = 0
         self.xs, self.xlens = load_x(self.shards[self.current_shard])
-        self.yrows, self.ys, self.ylens, self.yinds = load_y(self.get_y_shard_name(self.shards[self.current_shard]))
+        self.yrows, self.ys, self.ylens, self.yinds = load_y(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
@@ -316,7 +311,7 @@ class DataLoaderLite:
         if self.current_position + (B * T * self.num_processes) > len(self.xs):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.xs, self.xlens = load_x(self.shards[self.current_shard])
-            self.yrows, self.ys, self.ylens, self.yinds = load_y(self.get_y_shard_name(self.shards[self.current_shard]))
+            self.yrows, self.ys, self.ylens, self.yinds = load_y(self.shards[self.current_shard])
             self.current_position = self.B * self.T * self.process_rank
         return x, y, pos, mask
 

@@ -25,7 +25,7 @@ def get_char_to_tokens_for_word(word):
                 break
             if word_bytes[i:j] in enc._mergeable_ranks:
                 right.append(enc._mergeable_ranks[word_bytes[i:j]])
-        char2tokens.append([left[-1] if left else -1, tuple(right)])
+        char2tokens.append([left[-1] if left else -1, right])
     return char2tokens
 
 def unite_lists(lists):

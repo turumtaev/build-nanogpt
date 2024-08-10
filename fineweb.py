@@ -18,7 +18,7 @@ from tokenizer import get_char_to_tokens_for_text
 # ------------------------------------------
 local_dir = "edu_fineweb10B"
 remote_name = "sample-10BT"
-shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
+shard_size = int(1e6) # 100M tokens per shard, total of 100 shards
 
 # create the cache the local directory if it doesn't exist yet
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
@@ -31,6 +31,19 @@ fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train", 
 # init the tokenizer
 enc = tiktoken.get_encoding("gpt2")
 eot = enc._special_tokens['<|endoftext|>'] # end of text token
+
+def transform_y(y):
+    npy = np.array(y, dtype=object)
+    # get array of lengths
+    npl = np.vectorize(len)(npy)
+    csl = np.cumsum(npl)
+    # get array of indices
+    npi = np.insert(csl[:-1], 0, 0)
+    nprows = np.repeat(np.arange(len(npl)), npl)
+    npy = np.concatenate(npy)
+    npl_repeated = np.repeat(npl, npl)
+    return nprows, npy, npl_repeated, npi
+
 def tokenize(doc):
     # tokenizes a single document and returns a numpy array of uint16 tokens
     char2tokens = get_char_to_tokens_for_text(doc['text'])
@@ -41,11 +54,13 @@ def tokenize(doc):
     x_np = np.array(x)
     assert (0 <= x_np).all() and (x_np < 2**16).all(), "token dictionary too large for uint16"
     x_np_uint16 = x_np.astype(np.uint16)
-    y_np = np.array(y, dtype=object)
-    return x_np_uint16, y_np
+    return x_np_uint16, transform_y(y)
 
 def write_datafile(filename, data):
-    np.save(filename, data)
+    try:
+        np.save(filename, data)
+    except Exception as e:
+        print(f"Failed to save {filename}: {e}")
 
 def save_in_background(filename, data):
     process = mp.Process(target=write_datafile, args=(filename, data))
@@ -59,9 +74,15 @@ def main():
     with mp.Pool(nprocs) as pool:
         shard_index = 0
         # preallocate buffer to hold current shard
-        all_x_np = np.empty((shard_size,), dtype=np.uint16)
-        all_y_np = np.empty((shard_size,), dtype=object)
+        all_np = {
+            "x": np.empty((shard_size,), dtype=np.uint16),
+            "y": np.empty((shard_size * 10,), dtype=np.uint16),
+            "rows": np.empty((shard_size * 10,), dtype=np.int64),
+            "len": np.empty((shard_size * 10,), dtype=np.int64),
+            "indices": np.empty((shard_size,), dtype=np.int64),
+        }
         token_count = 0
+        y_count = 0
         progress_bar = None
         for x, y in pool.imap(tokenize, fw, chunksize=4):
             if shard_index >= 100:
@@ -69,9 +90,18 @@ def main():
             # is there enough space in the current shard for the new tokens?
             if token_count + len(x) < shard_size:
                 # simply append tokens to current shard
-                all_x_np[token_count:token_count+len(x)] = x
-                all_y_np[token_count:token_count+len(x)] = y
+                all_np["x"][token_count:token_count+len(x)] = x
+
+                nprows, npy, npl, npi = y
+                npi = npi + y_count
+                nprows = nprows + token_count
+                all_np["y"][y_count:y_count+len(npy)] = npy
+                all_np["rows"][y_count:y_count+len(npy)] = nprows
+                all_np["len"][y_count:y_count+len(npy)] = npl
+                all_np["indices"][token_count:token_count+len(x)] = npi
+
                 token_count += len(x)
+                y_count += len(npy)
                 # update progress bar
                 if progress_bar is None:
                     progress_bar = tqdm(total=shard_size, unit="tokens", desc=f"Shard {shard_index}")
@@ -80,31 +110,57 @@ def main():
                 # write the current shard and start a new one
                 # 10 times smaller shards -> 10 val shards
                 split = "val" if shard_index < 1 else "train"
-                x_filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_x_{split}_{shard_index:06d}")
-                y_filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_y_{split}_{shard_index:06d}")
+                filenames = {k: os.path.join(DATA_CACHE_DIR, f"edufineweb_{k}_{split}_{shard_index:06d}") for k in all_np}
                 # split the document into whatever fits in this shard; the remainder goes to next one
                 remainder = shard_size - token_count
                 progress_bar.update(remainder)
-                all_x_np[token_count:token_count+remainder] = x[:remainder]
-                all_y_np[token_count:token_count+remainder] = y[:remainder]
-                process_x = save_in_background(x_filename, all_x_np)
-                process_y = save_in_background(y_filename, all_y_np)
-                processes.extend([process_x, process_y])
+                all_np["x"][token_count:token_count+remainder] = x[:remainder]
+
+                nprows, npy, npl, npi = y
+                if remainder != len(x):
+                    npy_remainder = len(npy)
+                else:
+                    npy_remainder = npi[remainder]
+                    
+                npi = npi + y_count
+                nprows = nprows + token_count
+                all_np["y"][y_count:y_count+npy_remainder] = npy[:npy_remainder]
+                all_np["rows"][y_count:y_count+npy_remainder] = nprows[:npy_remainder]
+                all_np["len"][y_count:y_count+npy_remainder] = npl[:npy_remainder]
+                all_np["indices"][token_count:token_count+remainder] = npi[:remainder]
+                k2counts = {
+                    "x": token_count,
+                    "y": y_count,
+                    "rows": y_count,
+                    "len": y_count,
+                    "indices": token_count
+                }
+                cur_processes = [save_in_background(filenames[k], all_np[k][:k2counts[k]]) for k in all_np]
+                processes.extend(cur_processes)
                 shard_index += 1
                 progress_bar = None
                 # populate the next shard with the leftovers of the current doc
-                all_x_np[0:len(x)-remainder] = x[remainder:]
-                all_y_np[0:len(x)-remainder] = y[remainder:]
+                all_np["x"][0:len(x)-remainder] = x[remainder:]
+                all_np["y"][0:len(npy)-npy_remainder] = npy[npy_remainder:]
+                all_np["rows"][0:len(npy)-npy_remainder] = nprows[npy_remainder:]
+                all_np["len"][0:len(npy)-npy_remainder] = npl[npy_remainder:]
+                all_np["indices"][0:len(x)-remainder] = npi[remainder:]
                 token_count = len(x)-remainder
+                y_count = len(npy)-npy_remainder
 
         # write any remaining tokens as the last shard
         if token_count != 0 and shard_index < 100:
             split = "val" if shard_index < 1 else "train"
-            x_filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_x_{split}_{shard_index:06d}")
-            y_filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_y_{split}_{shard_index:06d}")
-            process_x = save_in_background(x_filename, all_x_np[:token_count])
-            process_y = save_in_background(y_filename, all_y_np[:token_count])
-            processes.extend([process_x, process_y])
+            filenames = {k: os.path.join(DATA_CACHE_DIR, f"edufineweb_{k}_{split}_{shard_index:06d}") for k in all_np}
+            k2counts = {
+                "x": token_count,
+                "y": y_count,
+                "rows": y_count,
+                "len": y_count,
+                "indices": token_count
+            }
+            cur_processes = [save_in_background(filenames[k], all_np[k][:k2counts[k]]) for k in all_np]
+            processes.extend(cur_processes)
         for process in processes:
             process.join()
 
