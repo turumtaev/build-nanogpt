@@ -154,7 +154,7 @@ def main():
                 all_np["y"][0:len(npy)-npy_remainder] = npy[npy_remainder:]
                 all_np["rows"][0:len(npy)-npy_remainder] = nprows[npy_remainder:]
                 all_np["len"][0:len(npy)-npy_remainder] = npl[npy_remainder:]
-                all_np["indices"][0:len(x)-remainder] = npi[remainder:]
+                all_np["indices"][0:len(x)-remainder] = npi[remainder:] - npi[remainder]
                 token_count = len(x)-remainder
                 y_count = len(npy)-npy_remainder
 
