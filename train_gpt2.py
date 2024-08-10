@@ -358,7 +358,7 @@ def reset_tokens(sequences):
     # Create mask
     for i, shift in enumerate(shifts):
         if shift > 0:
-            mask[i, max_len-shift:, :shift] = 0
+            mask[i, shift:, :shift] = 0
 
     return tokens, pos, mask, shifts
 
